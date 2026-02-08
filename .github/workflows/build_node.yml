@@ -22,6 +22,7 @@ jobs:
     
     steps:
       - name: Maximize build space
+        if: ${{ !env.ACT }}  # Only run on GitHub, not locally with act
         run: |
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /opt/ghc
@@ -34,13 +35,11 @@ jobs:
       
       - name: Checkout build scripts
         uses: actions/checkout@v4
-        with:
-          path: scripts
       
       - name: Prepare build
         run: |
-          cp scripts/build-node.sh termux-packages/
-          chmod +x termux-packages/build-node.sh
+          cp scripts/build_node.sh termux-packages/
+          chmod +x termux-packages/build_node.sh
     
       - name: Set up version
         id: version
@@ -49,12 +48,29 @@ jobs:
           VERSION=$(grep "^TERMUX_PKG_VERSION=" build.sh | cut -d'=' -f2 | tr -d '"' | tr -d "'")
           echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
           echo "Node.js version: $VERSION"
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27
+          add-to-path: true
+          local-cache: true
+      
+      - name: Setup build environment
+        working-directory: termux-packages
+        run: |
+          # Create the expected NDK directory structure
+          sudo mkdir -p /root/lib
+          sudo ln -s $ANDROID_NDK_HOME /root/lib/android-ndk
+          
+          # Install termux build dependencies
+          ./scripts/setup-ubuntu.sh
       
       - name: Build Node.js for all architectures
         working-directory: termux-packages
         run: |
           echo "Building Node.js"
-          ./scripts/run-docker.sh ./build-node.sh
+          ./build_node.sh
       
       - name: Verify build outputs
         run: |
@@ -119,7 +135,7 @@ jobs:
           cat SHA256SUMS.txt
       
       - name: Upload arm64-v8a
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v3
         with:
           name: nodejs-${{ steps.version.outputs.VERSION }}-arm64-v8a
           path: ${{ github.workspace }}/release/nodejs-${{ steps.version.outputs.VERSION }}-arm64-v8a.zip
@@ -127,7 +143,7 @@ jobs:
           compression-level: 0
       
       - name: Upload armeabi-v7a
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v3
         with:
           name: nodejs-${{ steps.version.outputs.VERSION }}-armeabi-v7a
           path: ${{ github.workspace }}/release/nodejs-${{ steps.version.outputs.VERSION }}-armeabi-v7a.zip
@@ -135,7 +151,7 @@ jobs:
           compression-level: 0
       
       - name: Upload x86
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v3
         with:
           name: nodejs-${{ steps.version.outputs.VERSION }}-x86
           path: ${{ github.workspace }}/release/nodejs-${{ steps.version.outputs.VERSION }}-x86.zip
@@ -143,7 +159,7 @@ jobs:
           compression-level: 0
       
       - name: Upload x86_64
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v3
         with:
           name: nodejs-${{ steps.version.outputs.VERSION }}-x86_64
           path: ${{ github.workspace }}/release/nodejs-${{ steps.version.outputs.VERSION }}-x86_64.zip
@@ -151,7 +167,7 @@ jobs:
           compression-level: 0
       
       - name: Upload checksums
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v3
         with:
           name: nodejs-${{ steps.version.outputs.VERSION }}-SHA256SUMS
           path: ${{ github.workspace }}/release/SHA256SUMS.txt

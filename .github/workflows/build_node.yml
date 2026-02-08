@@ -46,28 +46,12 @@ jobs:
           echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
           echo "Node.js version: $VERSION"
 
-      - name: Setup Android NDK
-        uses: nttld/setup-ndk@v1
-        with:
-          ndk-version: r27
-          add-to-path: true
-          local-cache: true
-      
-      - name: Setup build environment
-        working-directory: termux-packages
-        run: |
-          # Create the expected NDK directory structure
-          sudo mkdir -p /root/lib
-          sudo ln -s $ANDROID_NDK_HOME /root/lib/android-ndk
-          
-          # Install termux build dependencies
-          ./scripts/setup-ubuntu.sh
-      
       - name: Build Node.js for all architectures
         working-directory: termux-packages
         run: |
           echo "Building Node.js"
-          ./build_node.sh
+          ./scripts/run-docker.sh ./clean.sh
+          ./scripts/run-docker.sh ./build_node.sh
       
       - name: Verify build outputs
         run: |

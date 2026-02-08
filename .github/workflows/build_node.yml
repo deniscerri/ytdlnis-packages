@@ -19,14 +19,14 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-      - name: Maximize build space
-        if: ${{ !env.ACT }}  # Only run on GitHub, not locally with act
-        run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /usr/local/share/boost
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
-          df -h
+    #   - name: Maximize build space
+    #     if: ${{ !env.ACT }}  # Only run on GitHub, not locally with act
+    #     run: |
+    #       sudo rm -rf /usr/share/dotnet
+    #       sudo rm -rf /opt/ghc
+    #       sudo rm -rf /usr/local/share/boost
+    #       sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+    #       df -h
       
       - name: Checkout termux-packages
         run: git clone --depth=1 https://github.com/termux/termux-packages

@@ -27,12 +27,11 @@ jobs:
     #       sudo rm -rf /usr/local/share/boost
     #       sudo rm -rf "$AGENT_TOOLSDIRECTORY"
     #       df -h
+      - name: Checkout build scripts
+        uses: actions/checkout@v4
       
       - name: Checkout termux-packages
         run: git clone --depth=1 https://github.com/termux/termux-packages
-      
-      - name: Checkout build scripts
-        uses: actions/checkout@v4
       
       - name: Prepare build
         run: |

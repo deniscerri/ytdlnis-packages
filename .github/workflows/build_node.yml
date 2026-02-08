@@ -1,0 +1,177 @@
+name: Build Node.js for Android
+
+on:
+  push:
+    branches:
+      - main
+      - master
+      - develop
+    paths:
+      - 'scripts/build_node.sh'
+      - '.github/workflows/build-node.yml'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Node.js plugin for YTDLnis'
+        required: true
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Maximize build space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          df -h
+      
+      - name: Checkout termux-packages
+        run: git clone --depth=1 https://github.com/termux/termux-packages
+      
+      - name: Checkout build scripts
+        uses: actions/checkout@v4
+        with:
+          path: scripts
+      
+      - name: Prepare build
+        run: |
+          cp scripts/build-node.sh termux-packages/
+          chmod +x termux-packages/build-node.sh
+    
+      - name: Set up version
+        id: version
+        run: |
+          cd termux-packages/packages/nodejs
+          VERSION=$(grep "^TERMUX_PKG_VERSION=" build.sh | cut -d'=' -f2 | tr -d '"' | tr -d "'")
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "Node.js version: $VERSION"
+      
+      - name: Build Node.js for all architectures
+        working-directory: termux-packages
+        run: |
+          echo "Building Node.js"
+          ./scripts/run-docker.sh ./build-node.sh
+      
+      - name: Verify build outputs
+        run: |
+          echo "=== JNI Libraries Structure ==="
+          find termux-packages/jniLibs -type f
+          
+          for arch in arm64-v8a armeabi-v7a x86 x86_64; do
+            if [ -d "termux-packages/jniLibs/$arch" ]; then
+              echo "--- $arch ---"
+              ls -lh "termux-packages/jniLibs/$arch/"
+            fi
+          done
+
+      - name: Create release packages
+        id: package
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          RELEASE_DIR="${{ github.workspace }}/release"
+          mkdir -p "$RELEASE_DIR"
+          
+          cd termux-packages/jniLibs
+          
+          # Package each architecture
+          for arch in arm64-v8a armeabi-v7a x86 x86_64; do
+            if [ -d "$arch" ]; then
+              echo "Packaging $arch..."
+              
+              # Verify required files exist
+              if [ ! -f "$arch/libnode.so" ]; then
+                echo "ERROR: libnode.so not found in $arch"
+                exit 1
+              fi
+              if [ ! -f "$arch/libnode.zip.so" ]; then
+                echo "ERROR: libnode.zip.so not found in $arch"
+                exit 1
+              fi
+              
+              # Create zip: nodejs-VERSION-ARCH.zip
+              ZIP_NAME="nodejs-${VERSION}-${arch}.zip"
+              cd "$arch"
+              zip -9 "$RELEASE_DIR/$ZIP_NAME" *
+              cd ..
+              
+              echo "✓ Created: $ZIP_NAME"
+              ls -lh "$RELEASE_DIR/$ZIP_NAME"
+            else
+              echo "⚠ WARNING: Architecture $arch not found"
+            fi
+          done
+          
+          # List all created packages
+          echo ""
+          echo "=== Release Packages ==="
+          ls -lh "$RELEASE_DIR/"
+      
+      - name: Generate checksums
+        working-directory: ${{ github.workspace }}/release
+        run: |
+          sha256sum *.zip > SHA256SUMS.txt
+          echo ""
+          echo "=== SHA256 Checksums ==="
+          cat SHA256SUMS.txt
+      
+      - name: Upload arm64-v8a
+        uses: actions/upload-artifact@v4
+        with:
+          name: nodejs-${{ steps.version.outputs.VERSION }}-arm64-v8a
+          path: ${{ github.workspace }}/release/nodejs-${{ steps.version.outputs.VERSION }}-arm64-v8a.zip
+          retention-days: 90
+          compression-level: 0
+      
+      - name: Upload armeabi-v7a
+        uses: actions/upload-artifact@v4
+        with:
+          name: nodejs-${{ steps.version.outputs.VERSION }}-armeabi-v7a
+          path: ${{ github.workspace }}/release/nodejs-${{ steps.version.outputs.VERSION }}-armeabi-v7a.zip
+          retention-days: 90
+          compression-level: 0
+      
+      - name: Upload x86
+        uses: actions/upload-artifact@v4
+        with:
+          name: nodejs-${{ steps.version.outputs.VERSION }}-x86
+          path: ${{ github.workspace }}/release/nodejs-${{ steps.version.outputs.VERSION }}-x86.zip
+          retention-days: 90
+          compression-level: 0
+      
+      - name: Upload x86_64
+        uses: actions/upload-artifact@v4
+        with:
+          name: nodejs-${{ steps.version.outputs.VERSION }}-x86_64
+          path: ${{ github.workspace }}/release/nodejs-${{ steps.version.outputs.VERSION }}-x86_64.zip
+          retention-days: 90
+          compression-level: 0
+      
+      - name: Upload checksums
+        uses: actions/upload-artifact@v4
+        with:
+          name: nodejs-${{ steps.version.outputs.VERSION }}-SHA256SUMS
+          path: ${{ github.workspace }}/release/SHA256SUMS.txt
+          retention-days: 90
+      
+      - name: Build Summary
+        run: |
+          echo "## Build Complete! 🎉" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Version:** ${{ steps.version.outputs.VERSION }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Trigger:** File change in build_node.sh" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Artifacts Created:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          cd ${{ github.workspace }}/release
+          for file in *.zip; do
+            size=$(ls -lh "$file" | awk '{print $5}')
+            echo "- \`$file\` ($size)" >> $GITHUB_STEP_SUMMARY
+          done
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Each architecture is available as a separate artifact." >> $GITHUB_STEP_SUMMARY
+          echo "Download individual artifacts from the Actions tab." >> $GITHUB_STEP_SUMMARY

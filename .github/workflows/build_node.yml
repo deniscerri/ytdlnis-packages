@@ -36,7 +36,7 @@ jobs:
       
       - name: Prepare build
         run: |
-          cp scripts/build_node.sh termux-packages/
+          cp scripts/build_node.sh termux-packages/build_node.sh
           chmod +x termux-packages/build_node.sh
     
       - name: Set up version

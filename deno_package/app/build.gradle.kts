@@ -8,21 +8,19 @@ plugins {
     alias(libs.plugins.android.application)
 }
 
-val versionMajor = 3
-val versionMinor = 12
-val versionPatch = 11
+val versionMajor = 2
+val versionMinor = 7
+val versionPatch = 7
 
 val abiCodes = mapOf(
-    "armeabi-v7a" to 1,
     "arm64-v8a" to 2,
-    "x86" to 3,
     "x86_64" to 4
 )
 
 android {
-    namespace = "com.deniscerri.ytdl.python"
+    namespace = "com.deniscerri.ytdl.deno"
     compileSdk = 36
-    
+
     val properties = Properties()
     val propertiesFile = rootProject.file("keystore.properties")
 
@@ -44,7 +42,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.deniscerri.ytdl.python"
+        applicationId = "com.deniscerri.ytdl.deno"
         minSdk = 24
         targetSdk = 36
 
@@ -59,7 +57,7 @@ android {
         abi {
             isEnable = true
             reset()
-            include("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
+            include("arm64-v8a", "x86_64")
             isUniversalApk = true
         }
     }

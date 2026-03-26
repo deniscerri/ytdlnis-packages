@@ -1,4 +1,8 @@
 import com.android.build.api.variant.FilterConfiguration
+import com.android.tools.build.jetifier.core.utils.Log
+import org.gradle.kotlin.dsl.getByName
+import java.io.FileInputStream
+import java.util.Properties
 
 plugins {
     alias(libs.plugins.android.application)
@@ -18,6 +22,26 @@ val abiCodes = mapOf(
 android {
     namespace = "com.deniscerri.ytdl.nodejs"
     compileSdk = 36
+
+    val properties = Properties()
+    val propertiesFile = rootProject.file("keystore.properties")
+
+    if (propertiesFile.exists()) {
+        try {
+            FileInputStream(propertiesFile).use { stream ->
+                properties.load(stream)
+            }
+
+            signingConfigs {
+                getByName("debug") {
+                    storeFile = file(properties.getProperty("signingConfig.storeFile"))
+                    storePassword = properties.getProperty("signingConfig.storePassword")
+                    keyAlias = properties.getProperty("signingConfig.keyAlias")
+                    keyPassword = properties.getProperty("signingConfig.keyPassword")
+                }
+            }
+        } catch (e: Exception) {}
+    }
 
     defaultConfig {
         applicationId = "com.deniscerri.ytdl.nodejs"
@@ -59,8 +83,11 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            isDebuggable = false
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
 

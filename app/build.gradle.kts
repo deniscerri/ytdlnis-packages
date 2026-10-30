@@ -12,9 +12,9 @@ data class AppVersion(val major: Int, val minor: Int, val patch: Int) {
 }
 
 val flavorVersions = mapOf(
-    "nodejs" to Pair("NodeJS", AppVersion(major = 26, minor = 4, patch = 0)),
+    "nodejs" to Pair("NodeJS", AppVersion(major = 26, minor = 12, patch = 1)),
     "deno" to Pair("Deno", AppVersion(major = 2, minor = 7, patch = 7)),
-    "python" to Pair("Python", AppVersion(major = 3, minor = 14, patch = 6)),
+    "python" to Pair("Python", AppVersion(major = 3, minor = 14, patch = 8)),
     "ffmpeg" to Pair("FFmpeg", AppVersion(major = 7, minor = 1, patch = 1)),
 )
 

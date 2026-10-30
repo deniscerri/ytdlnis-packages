@@ -12,7 +12,7 @@ plugins {
 object LibraryConfig {
     const val GROUP_ID = "io.github.deniscerri"
     const val ARTIFACT_ID = "ytdlnis_packages.nodejs"
-    const val VERSION = "25.3.0"
+    const val VERSION = "26.12.1"
     const val NAME = "NodeJS JNI Library"
     const val DESCRIPTION = "Native shared nodejs libraries built from termux-packages packaged for Android"
     const val NAMESPACE = "com.deniscerri.ytdl.nodejs.library"

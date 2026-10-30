@@ -58,18 +58,17 @@ NATIVE_PKGS_CURLCFFI=("python-cffi")
 # as their -none-any.whl wheels and are architecture independent.
 PURE_PKGS=(
     "requests:2.34.2"
-    "certifi:2026.6.17"
-    "charset-normalizer:3.4.9"
-    "idna:3.18"
-    "urllib3:2.7.0"
-    "websockets:16.1"
+    "certifi:2026.10.23"
+    "charset-normalizer:3.5.2"
+    "idna:3.20"
+    "urllib3:2.8.0"
+    "websockets:17.3"
     "mutagen:1.48.1"
-    "pycparser:2.22"     # runtime dep of cffi
+    "pycparser:3.12"
 )
 
-# Prebuilt curl-cffi android wheel (arm64 / aarch64 only, abi3 -> works on 3.13+).
-CURL_CFFI_VERSION="0.15.1b2"
-CURL_CFFI_WHEEL="curl_cffi-${CURL_CFFI_VERSION}-cp313-abi3-android_24_arm64_v8a.whl"
+CURL_CFFI_VERSION="0.16.3"
+CURL_CFFI_WHEEL="curl_cffi-${CURL_CFFI_VERSION}-cp314-cp314-android_24_arm64_v8a.whl"
 CURL_CFFI_URL="https://github.com/lexiforest/curl_cffi/releases/download/v${CURL_CFFI_VERSION}/${CURL_CFFI_WHEEL}"
 
 # Name the jniLibs folders with Android ABI names (arm64-v8a / armeabi-v7a /
@@ -100,9 +99,96 @@ android_abi() {
     esac
 }
 
+# ------------------------------------------------------------------------------------------------
+# Shared-library isolation + .deb selection. KEEP IDENTICAL in build_node.sh, build_python.sh,
+# build_ffmpeg.sh and build-deno.sh.
+#
+# The app puts every package's usr/lib on ONE LD_LIBRARY_PATH. Each bundle ships its own copy of
+# common libs (libffi.so, libssl.so.3, libz.so.1, ...), built at different times, and the linker
+# takes the first file with a matching name -- so the package listed first decides the version for
+# everyone (node failed with "cannot locate symbol ffi_call_plan_free" because python's older
+# libffi.so won). isolate_libs gives every bundled lib a package-unique SONAME
+# (libffi.so -> libffi_<tag>.so) and rewrites DT_NEEDED in every ELF of the bundle to match, so a
+# bundle can never resolve another bundle's libs and the package order in the app stops mattering.
+# The old name stays as a symlink to the renamed lib, for code that dlopen()s by name and for native
+# wheels / addons installed later that still link against the plain name.
+# ------------------------------------------------------------------------------------------------
+ELF_PAGE_SIZE=16384 # patchelf segment alignment: 16 KB also works on 4 KB devices, required on 16 KB ones
+
+is_elf() {
+    [ -f "$1" ] && [ ! -L "$1" ] && [ "$(head -c 4 "$1" 2>/dev/null | od -An -tx1 | tr -d ' \n')" = "7f454c46" ]
+}
+
+# libssl.so.3 -> libssl_<tag>.so.3
+tag_soname() { printf '%s_%s.so%s' "${1%%.so*}" "$2" "${1#*.so}"; }
+
+# isolate_libs <usr-dir> <tag> [regex of sonames to leave untouched]
+isolate_libs() {
+    local usr="$1" tag="$2" keep="${3:-}" lib="$1/lib" f soname new n patched=0
+    local -A map=()
+    local args=()
+
+    # 1. rename every real shared library in usr/lib to its tagged soname
+    while IFS= read -r f; do
+        is_elf "$f" || continue
+        soname="$(patchelf --print-soname "$f" 2>/dev/null || true)"
+        [ -n "$soname" ] || soname="$(basename "$f")"
+        case "$soname" in *.so|*.so.*) ;; *) continue ;; esac
+        case "$soname" in *_"$tag".so*) continue ;; esac # already isolated
+        if [ -n "$keep" ] && [[ "$soname" =~ $keep ]]; then continue; fi
+        if [ -n "${map[$soname]:-}" ]; then
+            info "isolate: $(basename "$f") has the same soname as another lib ($soname), left as is"
+            continue
+        fi
+        new="$(tag_soname "$soname" "$tag")"
+        patchelf --page-size "$ELF_PAGE_SIZE" --set-soname "$new" "$f"
+        mv "$f" "$lib/$new"
+        map["$soname"]="$new"
+    done < <(find "$lib" -maxdepth 1 -type f -name '*.so*')
+
+    # 2. the old symlinks (libfoo.so -> libfoo.so.1) now dangle: drop them, point the old sonames at the renamed files
+    find "$lib" -maxdepth 1 -xtype l -delete
+    for soname in "${!map[@]}"; do
+        [ -e "$lib/$soname" ] || ln -s "${map[$soname]}" "$lib/$soname"
+    done
+
+    # 3. rewrite DT_NEEDED in every ELF of the bundle (binaries, libs, python extensions, node addons, openssl modules)
+    while IFS= read -r f; do
+        is_elf "$f" || continue
+        args=()
+        while IFS= read -r n; do
+            if [ -n "$n" ] && [ -n "${map[$n]:-}" ]; then args+=(--replace-needed "$n" "${map[$n]}"); fi
+        done < <(patchelf --print-needed "$f" 2>/dev/null || true)
+        if [ "${#args[@]}" -gt 0 ]; then
+            patchelf --page-size "$ELF_PAGE_SIZE" "${args[@]}" "$f"
+            patched=$((patched + 1))
+        fi
+    done < <(find "$usr" -type f \( -path "$usr/bin/*" -o -name '*.so' -o -name '*.so.*' -o -name '*.node' \))
+
+    info "isolate: renamed ${#map[@]} libs to *_${tag}.so*, rewrote DT_NEEDED in $patched files"
+}
+
+# Print one .deb per package (its highest version) from an arch output dir. Rebuilding for a newer
+# version leaves the old .deb next to the new one, and unpacking both lets the glob order decide
+# whose files win (for python that even means picking the old python3.x dir).
+latest_debs() {
+    local dir="$1" arch="$2" deb pkg ver
+    local -A best=() bestver=()
+    for deb in "$dir"/*_"$arch".deb "$dir"/*_all.deb; do
+        pkg="$(dpkg-deb -f "$deb" Package)"
+        ver="$(dpkg-deb -f "$deb" Version)"
+        if [ -z "${best[$pkg]:-}" ] || dpkg --compare-versions "$ver" gt "${bestver[$pkg]}"; then
+            best["$pkg"]="$deb"
+            bestver["$pkg"]="$ver"
+        fi
+    done
+    for pkg in "${!best[@]}"; do printf '%s\n' "${best[$pkg]}"; done | sort
+}
+# ------------------------------------------------------------------------------------------------
+
 check_prereqs() {
     [ -x ./build-package.sh ] || die "build-package.sh not found. Run this from the termux-packages root."
-    for t in curl unzip zip dpkg-deb python3 patchelf; do
+    for t in curl unzip zip dpkg dpkg-deb python3 patchelf; do
         command -v "$t" >/dev/null 2>&1 || die "required tool '$t' not found on PATH."
     done
 }
@@ -137,8 +223,8 @@ TERMUX_PKG_DESCRIPTION="Foreign Function Interface for Python calling C code"
 TERMUX_PKG_LICENSE="MIT"
 TERMUX_PKG_MAINTAINER="you"
 TERMUX_PKG_VERSION="2.0.0"
-TERMUX_PKG_SRCURL="https://files.pythonhosted.org/packages/eb/56/b1ba7935a17738ae8453301356628e8147c79dbb825bcbc73dc7401f9846/cffi-${TERMUX_PKG_VERSION}.tar.gz"
-TERMUX_PKG_SHA256=44d1b5909021139fe36001ae048dbdde8214afa20200eda0f64c068cac5d5529
+TERMUX_PKG_SRCURL=https://files.pythonhosted.org/packages/9e/ef/008a1939e372c06329a3fce4279c02f328488f3526744906eeec3da7ad5f/cffi-${TERMUX_PKG_VERSION}.tar.gz
+TERMUX_PKG_SHA256=dd31f52ea1086513bb9df30f8fcee9b8918323ae067a3d5b78bc826a000712be
 TERMUX_PKG_DEPENDS="python, python-pip, libffi"
 TERMUX_PKG_SETUP_PYTHON=true
 TERMUX_PKG_BUILD_IN_SRC=true
@@ -256,8 +342,7 @@ for ARCH in "${ARCHITECTURES[@]}"; do
     # of them (rather than a hand-picked list) guarantees python's whole runtime
     # closure -- and every stdlib backing lib -- is present.
     got_python=false
-    for deb in "${OUTPUT_BASE_DIR}/${ARCH}"/*_"${ARCH}".deb \
-               "${OUTPUT_BASE_DIR}/${ARCH}"/*_all.deb; do
+    while IFS= read -r deb; do
         base="$(basename "$deb")"
         case "$base" in
             *-static_*.deb) continue ;;
@@ -265,7 +350,7 @@ for ARCH in "${ARCHITECTURES[@]}"; do
         info "unpack $base"
         dpkg-deb -x "$deb" "$EX"
         case "$base" in python_*) got_python=true ;; esac
-    done
+    done < <(latest_debs "${OUTPUT_BASE_DIR}/${ARCH}" "$ARCH")
     $got_python || die "python .deb not found for ${ARCH} (build incomplete)"
 
     # Warn loudly if a known-critical backing lib is missing.
@@ -296,6 +381,20 @@ for ARCH in "${ARCHITECTURES[@]}"; do
     # Sanity check: the interpreter binary must exist.
     PYBIN="${PREFIX_DIR}/bin/python${PYVER}"
     [ -f "$PYBIN" ] || die "python${PYVER} binary not found for $ARCH"
+
+    # Package-unique library names. libpython keeps its name: native wheels pip installs
+    # later on the device link against libpython3.x.so.
+    isolate_libs "$PREFIX_DIR" python '^libpython'
+
+    # Every DT_NEEDED of the interpreter and its extension modules must now be bundled (or be an
+    # Android system lib), otherwise a rename was missed and it would only show up on the device.
+    missing=()
+    while IFS= read -r n; do
+        case " libc.so libm.so libdl.so liblog.so libandroid.so libz.so " in *" $n "*) continue ;; esac
+        [ -e "${PREFIX_DIR}/lib/$n" ] || missing+=("$n")
+    done < <(find "${PREFIX_DIR}/bin" "${PREFIX_DIR}/lib" -type f \( -path "${PREFIX_DIR}/bin/*" -o -name '*.so' -o -name '*.so.*' \) \
+                 -exec patchelf --print-needed {} \; 2>/dev/null | sort -u)
+    [ "${#missing[@]}" -eq 0 ] || die "libraries needed by python but not in the bundle for $ARCH: ${missing[*]}"
 
     # Build the two artifacts.
     tmp_so="${WORK}/libpython.so"

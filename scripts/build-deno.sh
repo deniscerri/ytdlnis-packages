@@ -40,9 +40,96 @@ android_abi() {
     esac
 }
 
+# ------------------------------------------------------------------------------------------------
+# Shared-library isolation + .deb selection. KEEP IDENTICAL in build_node.sh, build_python.sh,
+# build_ffmpeg.sh and build-deno.sh.
+#
+# The app puts every package's usr/lib on ONE LD_LIBRARY_PATH. Each bundle ships its own copy of
+# common libs (libffi.so, libssl.so.3, libz.so.1, ...), built at different times, and the linker
+# takes the first file with a matching name -- so the package listed first decides the version for
+# everyone (node failed with "cannot locate symbol ffi_call_plan_free" because python's older
+# libffi.so won). isolate_libs gives every bundled lib a package-unique SONAME
+# (libffi.so -> libffi_<tag>.so) and rewrites DT_NEEDED in every ELF of the bundle to match, so a
+# bundle can never resolve another bundle's libs and the package order in the app stops mattering.
+# The old name stays as a symlink to the renamed lib, for code that dlopen()s by name and for native
+# wheels / addons installed later that still link against the plain name.
+# ------------------------------------------------------------------------------------------------
+ELF_PAGE_SIZE=16384 # patchelf segment alignment: 16 KB also works on 4 KB devices, required on 16 KB ones
+
+is_elf() {
+    [ -f "$1" ] && [ ! -L "$1" ] && [ "$(head -c 4 "$1" 2>/dev/null | od -An -tx1 | tr -d ' \n')" = "7f454c46" ]
+}
+
+# libssl.so.3 -> libssl_<tag>.so.3
+tag_soname() { printf '%s_%s.so%s' "${1%%.so*}" "$2" "${1#*.so}"; }
+
+# isolate_libs <usr-dir> <tag> [regex of sonames to leave untouched]
+isolate_libs() {
+    local usr="$1" tag="$2" keep="${3:-}" lib="$1/lib" f soname new n patched=0
+    local -A map=()
+    local args=()
+
+    # 1. rename every real shared library in usr/lib to its tagged soname
+    while IFS= read -r f; do
+        is_elf "$f" || continue
+        soname="$(patchelf --print-soname "$f" 2>/dev/null || true)"
+        [ -n "$soname" ] || soname="$(basename "$f")"
+        case "$soname" in *.so|*.so.*) ;; *) continue ;; esac
+        case "$soname" in *_"$tag".so*) continue ;; esac # already isolated
+        if [ -n "$keep" ] && [[ "$soname" =~ $keep ]]; then continue; fi
+        if [ -n "${map[$soname]:-}" ]; then
+            info "isolate: $(basename "$f") has the same soname as another lib ($soname), left as is"
+            continue
+        fi
+        new="$(tag_soname "$soname" "$tag")"
+        patchelf --page-size "$ELF_PAGE_SIZE" --set-soname "$new" "$f"
+        mv "$f" "$lib/$new"
+        map["$soname"]="$new"
+    done < <(find "$lib" -maxdepth 1 -type f -name '*.so*')
+
+    # 2. the old symlinks (libfoo.so -> libfoo.so.1) now dangle: drop them, point the old sonames at the renamed files
+    find "$lib" -maxdepth 1 -xtype l -delete
+    for soname in "${!map[@]}"; do
+        [ -e "$lib/$soname" ] || ln -s "${map[$soname]}" "$lib/$soname"
+    done
+
+    # 3. rewrite DT_NEEDED in every ELF of the bundle (binaries, libs, python extensions, node addons, openssl modules)
+    while IFS= read -r f; do
+        is_elf "$f" || continue
+        args=()
+        while IFS= read -r n; do
+            if [ -n "$n" ] && [ -n "${map[$n]:-}" ]; then args+=(--replace-needed "$n" "${map[$n]}"); fi
+        done < <(patchelf --print-needed "$f" 2>/dev/null || true)
+        if [ "${#args[@]}" -gt 0 ]; then
+            patchelf --page-size "$ELF_PAGE_SIZE" "${args[@]}" "$f"
+            patched=$((patched + 1))
+        fi
+    done < <(find "$usr" -type f \( -path "$usr/bin/*" -o -name '*.so' -o -name '*.so.*' -o -name '*.node' \))
+
+    info "isolate: renamed ${#map[@]} libs to *_${tag}.so*, rewrote DT_NEEDED in $patched files"
+}
+
+# Print one .deb per package (its highest version) from an arch output dir. Rebuilding for a newer
+# version leaves the old .deb next to the new one, and unpacking both lets the glob order decide
+# whose files win (for python that even means picking the old python3.x dir).
+latest_debs() {
+    local dir="$1" arch="$2" deb pkg ver
+    local -A best=() bestver=()
+    for deb in "$dir"/*_"$arch".deb "$dir"/*_all.deb; do
+        pkg="$(dpkg-deb -f "$deb" Package)"
+        ver="$(dpkg-deb -f "$deb" Version)"
+        if [ -z "${best[$pkg]:-}" ] || dpkg --compare-versions "$ver" gt "${bestver[$pkg]}"; then
+            best["$pkg"]="$deb"
+            bestver["$pkg"]="$ver"
+        fi
+    done
+    for pkg in "${!best[@]}"; do printf '%s\n' "${best[$pkg]}"; done | sort
+}
+# ------------------------------------------------------------------------------------------------
+
 check_prereqs() {
     [ -x ./build-package.sh ] || die "build-package.sh not found. Run this from the termux-packages root."
-    for t in zip dpkg-deb llvm-strip; do
+    for t in zip dpkg dpkg-deb llvm-strip patchelf; do
         command -v "$t" >/dev/null 2>&1 || die "required tool '$t' not found on PATH."
     done
 }
@@ -90,15 +177,14 @@ for ARCH in "${ARCHITECTURES[@]}"; do
     rm -rf "$EX"; mkdir -p "$EX"
 
     # 1. Unpack non-static .deb packages
-    for deb in "${OUTPUT_BASE_DIR}/${ARCH}"/*_"${ARCH}".deb \
-               "${OUTPUT_BASE_DIR}/${ARCH}"/*_all.deb; do
+    while IFS= read -r deb; do
         base="$(basename "$deb")"
         case "$base" in
             *-static_*.deb|*-dev_*.deb) continue ;;
         esac
         info "unpack $base"
         dpkg-deb -x "$deb" "$EX"
-    done
+    done < <(latest_debs "${OUTPUT_BASE_DIR}/${ARCH}" "$ARCH")
 
     FILES_DIR="${EX}/data/data/com.termux/files"
     USR="${FILES_DIR}/usr"
@@ -128,6 +214,9 @@ for ARCH in "${ARCHITECTURES[@]}"; do
     
     find "${USR}/lib" -type f -name "*.so*" -exec \
         sh -c 'llvm-strip --strip-unneeded "$1" 2>/dev/null || strip --strip-unneeded "$1" 2>/dev/null || true' _ {} \;
+
+    # 3b. Package-unique library names. After stripping: strip rewrites the files patchelf just laid out.
+    isolate_libs "$USR" deno
 
     # 4. Copy stripped executable to target
     cp "${USR}/bin/${BIN_NAME}" "${dest}/${LIB_PREFIX}.so"

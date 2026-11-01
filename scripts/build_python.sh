@@ -13,7 +13,7 @@
 # Bundled packages:
 #   native, all arches : python-pycryptodomex, python-brotli   (cross-compiled)
 #   native, arm64 only : python-cffi                            (cross-compiled)
-#   wheel,  arm64 only : curl-cffi  (prebuilt cp313-abi3 android wheel)
+#   wheel,  arm64 only : curl-cffi  (prebuilt cp314 android wheel)
 #   pure-python, all   : requests certifi charset-normalizer idna urllib3
 #                        websockets mutagen pycparser
 #
@@ -38,13 +38,22 @@ ALL_ARCHES=("aarch64" "arm" "i686" "x86_64")
 # .debs already in output/<arch>/ -- handy when only tweaking the packaging.
 SKIP_BUILD="${SKIP_BUILD:-0}"
 
+# 1 = give python's libs package-unique names (isolate_libs, as the other bundles do).
+# Off by default: ffmpeg builds from before isolate_libs (still installed by many users) don't
+# bundle libandroid-posix-semaphore, libandroid-support, libc++_shared, libcrypto and libexpat and
+# load python's copies by their plain names. Requires python's usr/lib to come before the isolated
+# bundles on LD_LIBRARY_PATH (their plain names are symlinks to their own renamed libs).
+ISOLATE="${ISOLATE:-0}"
+
 # Arches that additionally get cffi + curl-cffi (curl-cffi only ships an arm64
 # android wheel, and cffi is its native runtime dependency).
 CURL_CFFI_ARCHES=("aarch64")
 
-# Native termux packages to build per arch (python is implied, listed for clarity).
-NATIVE_PKGS=("python" "python-pycryptodomex" "python-brotli")
-# Extra native package built only for the CURL_CFFI_ARCHES.
+# Native python extension packages to build per arch (python itself is built first, see PHASE 1).
+# These are always rebuilt (-f): a copy built against an older python in a reused container would
+# otherwise be skipped and install into the old python3.x dir.
+NATIVE_PKGS=("python-pycryptodomex" "python-brotli")
+# Extra native package built only for the CURL_CFFI_ARCHES (recipe: packages/python-cffi).
 NATIVE_PKGS_CURLCFFI=("python-cffi")
 
 # NOTE: we deliberately do NOT hand-list which .debs to bundle. Phase 3 unpacks
@@ -64,12 +73,15 @@ PURE_PKGS=(
     "urllib3:2.8.0"
     "websockets:17.3"
     "mutagen:1.48.1"
-    "pycparser:3.12"
+    "pycparser:3.12"     # runtime dep of cffi
 )
 
-CURL_CFFI_VERSION="0.16.3"
+# Prebuilt curl-cffi android wheel (arm64 / aarch64 only). The cp tag must match the python
+# recipe's x.y (packages/python/build.sh); curl-cffi 0.16.x needs cffi >= 2.0.0.
+CURL_CFFI_VERSION="0.17.0"
 CURL_CFFI_WHEEL="curl_cffi-${CURL_CFFI_VERSION}-cp314-cp314-android_24_arm64_v8a.whl"
 CURL_CFFI_URL="https://github.com/lexiforest/curl_cffi/releases/download/v${CURL_CFFI_VERSION}/${CURL_CFFI_WHEEL}"
+CURL_CFFI_SHA256="0d85bec9648bf7c14c3b43056ba82521740f72cd96ed7700a0e1973e7fc93f74"
 
 # Name the jniLibs folders with Android ABI names (arm64-v8a / armeabi-v7a /
 # x86 / x86_64) so they can be dropped straight into the app's jniLibs.
@@ -77,7 +89,10 @@ USE_ANDROID_ABI_NAMES=true
 
 OUTPUT_BASE_DIR="${PWD}/output"
 JNI_DIR="${OUTPUT_BASE_DIR}/jniLibs"
-WORK="${OUTPUT_BASE_DIR}/_work"
+# Scratch dir for unpacking/patching. Must be on the container's own filesystem: on a bind-mounted
+# Windows/macOS checkout (Docker Desktop) tar fails with "Directory renamed before its status could
+# be extracted" and symlinks/patchelf are unreliable. Only the final artifacts go to output/.
+WORK="${WORK_DIR:-/tmp/ytdlnis-work}/python"
 PURE_SITE="${WORK}/pure-site"          # shared, arch independent
 CURLCFFI_SITE="${WORK}/curl-cffi-site" # arm64 only
 
@@ -124,13 +139,20 @@ tag_soname() { printf '%s_%s.so%s' "${1%%.so*}" "$2" "${1#*.so}"; }
 
 # isolate_libs <usr-dir> <tag> [regex of sonames to leave untouched]
 isolate_libs() {
-    local usr="$1" tag="$2" keep="${3:-}" lib="$1/lib" f soname new n patched=0
-    local -A map=()
+    local usr="$1" tag="$2" keep="${3:-}" lib="$1/lib" f soname new n base patched=0
+    local -A map=() renamed=() links=()
     local args=()
+
+    # 0. remember which real file every usr/lib symlink points at. A lib without a SONAME (libsqlite)
+    #    is linked by the symlink's name (DT_NEEDED libsqlite3.so), so that name has to follow the rename.
+    while IFS= read -r f; do
+        links["$(basename "$f")"]="$(basename "$(readlink -f "$f")")"
+    done < <(find "$lib" -maxdepth 1 -type l -name '*.so*')
 
     # 1. rename every real shared library in usr/lib to its tagged soname
     while IFS= read -r f; do
         is_elf "$f" || continue
+        base="$(basename "$f")"
         soname="$(patchelf --print-soname "$f" 2>/dev/null || true)"
         [ -n "$soname" ] || soname="$(basename "$f")"
         case "$soname" in *.so|*.so.*) ;; *) continue ;; esac
@@ -144,7 +166,15 @@ isolate_libs() {
         patchelf --page-size "$ELF_PAGE_SIZE" --set-soname "$new" "$f"
         mv "$f" "$lib/$new"
         map["$soname"]="$new"
+        renamed["$base"]="$new"
     done < <(find "$lib" -maxdepth 1 -type f -name '*.so*')
+
+    # 1b. symlink names of a renamed lib (libsqlite3.so -> libsqlite3.so.3.54.1) map to it as well
+    for n in "${!links[@]}"; do
+        if [ -z "${map[$n]:-}" ] && [ -n "${links[$n]}" ] && [ -n "${renamed[${links[$n]}]:-}" ]; then
+            map["$n"]="${renamed[${links[$n]}]}"
+        fi
+    done
 
     # 2. the old symlinks (libfoo.so -> libfoo.so.1) now dangle: drop them, point the old sonames at the renamed files
     find "$lib" -maxdepth 1 -xtype l -delete
@@ -165,7 +195,7 @@ isolate_libs() {
         fi
     done < <(find "$usr" -type f \( -path "$usr/bin/*" -o -name '*.so' -o -name '*.so.*' -o -name '*.node' \))
 
-    info "isolate: renamed ${#map[@]} libs to *_${tag}.so*, rewrote DT_NEEDED in $patched files"
+    info "isolate: renamed ${#renamed[@]} libs to *_${tag}.so*, rewrote DT_NEEDED in $patched files"
 }
 
 # Print one .deb per package (its highest version) from an arch output dir. Rebuilding for a newer
@@ -188,15 +218,14 @@ latest_debs() {
 
 check_prereqs() {
     [ -x ./build-package.sh ] || die "build-package.sh not found. Run this from the termux-packages root."
-    for t in curl unzip zip dpkg dpkg-deb python3 patchelf; do
+    for t in curl unzip zip dpkg dpkg-deb python3 patchelf sha256sum; do
         command -v "$t" >/dev/null 2>&1 || die "required tool '$t' not found on PATH."
     done
 }
 
-# The prebuilt curl-cffi wheel is an abi3 wheel built on a *different* Python
-# (e.g. 3.13), so its _wrapper.abi3.so has a DT_NEEDED for libpython3.13.so.
-# On Android, extensions are hard-linked against libpython, so this must point
-# at the libpython we actually ship. abi3 = stable ABI, so retargeting is safe.
+# Safety net: if the curl-cffi wheel was built for a different python (e.g. an abi3 wheel built
+# on 3.13), its DT_NEEDED names that libpython. On Android, extensions are hard-linked against
+# libpython, so point it at the one we ship. No-op when the wheel's cp tag matches our python.
 patch_curl_cffi_libpython() {
     local so="$1" pyver="$2"
     [ -f "$so" ] || return 0
@@ -204,75 +233,44 @@ patch_curl_cffi_libpython() {
     cur="$(patchelf --print-needed "$so" | grep -E '^libpython3\.' | head -1 || true)"
     if [ -n "$cur" ] && [ "$cur" != "libpython${pyver}.so" ]; then
         info "patchelf: $cur -> libpython${pyver}.so  ($(basename "$so"))"
-        patchelf --replace-needed "$cur" "libpython${pyver}.so" "$so"
+        patchelf --page-size "$ELF_PAGE_SIZE" --replace-needed "$cur" "libpython${pyver}.so" "$so"
     fi
 }
 
-# Write the python-cffi recipe into the tree if it is not already there.
-ensure_cffi_recipe() {
-    local dir="packages/python-cffi"
-    if [ -f "$dir/build.sh" ]; then
-        info "python-cffi recipe already present."
-        return
-    fi
-    log "Creating $dir/build.sh"
-    mkdir -p "$dir"
-    cat > "$dir/build.sh" <<'RECIPE'
-TERMUX_PKG_HOMEPAGE=https://cffi.readthedocs.io/
-TERMUX_PKG_DESCRIPTION="Foreign Function Interface for Python calling C code"
-TERMUX_PKG_LICENSE="MIT"
-TERMUX_PKG_MAINTAINER="you"
-TERMUX_PKG_VERSION="2.0.0"
-TERMUX_PKG_SRCURL=https://files.pythonhosted.org/packages/9e/ef/008a1939e372c06329a3fce4279c02f328488f3526744906eeec3da7ad5f/cffi-${TERMUX_PKG_VERSION}.tar.gz
-TERMUX_PKG_SHA256=dd31f52ea1086513bb9df30f8fcee9b8918323ae067a3d5b78bc826a000712be
-TERMUX_PKG_DEPENDS="python, python-pip, libffi"
-TERMUX_PKG_SETUP_PYTHON=true
-TERMUX_PKG_BUILD_IN_SRC=true
-
-termux_step_pre_configure() {
-	LDFLAGS+=" -Wl,--no-as-needed -lpython${TERMUX_PYTHON_VERSION}"
+# The python-cffi recipe lives in the tree (packages/python-cffi/build.sh). It is not generated
+# here: the container's AppArmor profile forbids writing to the repo outside output/.
+check_cffi_recipe() {
+    [ -f "packages/python-cffi/build.sh" ] \
+        || die "packages/python-cffi/build.sh not found (needed for curl-cffi)."
 }
 
-termux_step_make() {
-	:
-}
-
-termux_step_make_install() {
-	pip install . --prefix="$TERMUX_PREFIX" -vv --no-build-isolation --no-deps
-}
-RECIPE
-}
-
-# Download a wheel (from a URL) and unzip it into a site dir.
+# Download a wheel (from a URL), verify its sha256 and unzip it into a site dir.
 unpack_wheel_url() {
-    local url="$1" site="$2"
+    local url="$1" site="$2" sha="$3"
     local file="${WORK}/$(basename "$url")"
     curl -fsSL "$url" -o "$file"
+    echo "${sha}  ${file}" | sha256sum -c --quiet - || die "sha256 mismatch for $(basename "$url")"
     unzip -q -o "$file" -d "$site"
 }
 
-# Resolve a PyPI "name:version" to its -none-any.whl download URL and unpack it.
+# Resolve a PyPI "name:version" to its -none-any.whl download URL (+ sha256) and unpack it.
 fetch_pure_pkg() {
     local entry="$1" site="$2"
     local name="${entry%%:*}" ver="${entry##*:}"
     info "pure  $name==$ver"
-    local url
-    url="$(curl -fsSL "https://pypi.org/pypi/${name}/${ver}/json" \
-        | python3 -c "import sys,json;d=json.load(sys.stdin);print(next(u['url'] for u in d['urls'] if u['filename'].endswith('-none-any.whl')))")" \
+    local url sha
+    read -r url sha < <(curl -fsSL "https://pypi.org/pypi/${name}/${ver}/json" \
+        | python3 -c "import sys,json;d=json.load(sys.stdin);u=next(u for u in d['urls'] if u['filename'].endswith('-none-any.whl'));print(u['url'],u['digests']['sha256'])") \
         || die "could not resolve a pure wheel for ${name}==${ver}"
-    unpack_wheel_url "$url" "$site"
+    sha="${sha%$'\r'}"
+    [ -n "$sha" ] || die "could not resolve a pure wheel for ${name}==${ver}"
+    unpack_wheel_url "$url" "$site" "$sha"
 }
 
 ########################  PHASE 0  ########################
 check_prereqs
-ensure_cffi_recipe
+check_cffi_recipe
 mkdir -p "$WORK" "$JNI_DIR"
-
-# Workaround: codeberg regenerated foot's 1.27.0 archive, drifting its sha256.
-# ncurses (a python dependency) fetches foot's tarball to build its terminfo, so
-# the stale checksum in x11-packages/foot/build.sh breaks the build. Correct it.
-# Self-clears (no-op) once the pinned termux-packages updates the value.
-sed -i 's/4e6131cc859ec6a36569f1978cf3617cc3836a681d13d228ded1b4885dab7770/9b9568ec5a9ff728f49c77d73644e7691fe386956e2d9acbdef0fc590e5828c8/' x11-packages/foot/build.sh 2>/dev/null || true
 
 # Select arches from the command line, defaulting to all of them.
 if [ "$#" -gt 0 ]; then
@@ -287,33 +285,11 @@ log "Target arches: ${ARCHITECTURES[*]}   (SKIP_BUILD=${SKIP_BUILD})"
 
 ########################  PHASE 1 - build native packages per arch  ########################
 if [ "$SKIP_BUILD" = "1" ]; then
-    log "SKIP_BUILD=1 -> skipping Phase 1, reusing existing .debs in output/<arch>/"
+    log "SKIP_BUILD=1 -> skipping the builds, reusing existing .debs in output/<arch>/"
 fi
-for ARCH in "${ARCHITECTURES[@]}"; do
-    if [ "$SKIP_BUILD" = "1" ]; then continue; fi
-    log "Building native packages for: $ARCH"
-    OUTPUT_DIR="${OUTPUT_BASE_DIR}/${ARCH}"
-    mkdir -p "$OUTPUT_DIR"
 
-    pkgs=("${NATIVE_PKGS[@]}")
-    if in_list "$ARCH" "${CURL_CFFI_ARCHES[@]}"; then
-        pkgs+=("${NATIVE_PKGS_CURLCFFI[@]}")
-    fi
-
-    info "packages: ${pkgs[*]}"
-    ./build-package.sh -a "$ARCH" -o "$OUTPUT_DIR" "${pkgs[@]}" \
-        || die "build failed for $ARCH"
-
-    # Defensive: collect debs that landed one level up -- but ONLY this arch's
-    # (and arch-independent "_all") so we never pull another arch's debs in here.
-    find "${OUTPUT_BASE_DIR}" -maxdepth 1 -type f \
-        \( -name "*_${ARCH}.deb" -o -name "*_all.deb" \) \
-        -exec mv -t "$OUTPUT_DIR/" {} + 2>/dev/null || true
-
-    info "done: $ARCH"
-done
-
-########################  PHASE 2 - fetch pure + curl-cffi wheels (once)  ########################
+########################  PHASE 1 - fetch pure + curl-cffi wheels (once)  ########################
+# Done first: it takes seconds, and a bad pin / checksum should fail before hours of building.
 log "Fetching pure-python wheels"
 rm -rf "$PURE_SITE"; mkdir -p "$PURE_SITE"
 for entry in "${PURE_PKGS[@]}"; do
@@ -323,10 +299,37 @@ done
 log "Fetching curl-cffi android wheel"
 rm -rf "$CURLCFFI_SITE"; mkdir -p "$CURLCFFI_SITE"
 info "$CURL_CFFI_WHEEL"
-unpack_wheel_url "$CURL_CFFI_URL" "$CURLCFFI_SITE"
+unpack_wheel_url "$CURL_CFFI_URL" "$CURLCFFI_SITE" "$CURL_CFFI_SHA256"
 
-########################  PHASE 3 - merge into JNI zip per arch  ########################
+# Each arch is built AND packaged before the next one starts, so a finished arch can be
+# tested while the others are still building (and a packaging error shows up early).
 for ARCH in "${ARCHITECTURES[@]}"; do
+    ########################  PHASE 2 - build native packages  ########################
+    OUTPUT_DIR="${OUTPUT_BASE_DIR}/${ARCH}"
+    mkdir -p "$OUTPUT_DIR"
+
+    if [ "$SKIP_BUILD" != "1" ]; then
+        log "Building native packages for: $ARCH"
+        pkgs=("${NATIVE_PKGS[@]}")
+        if in_list "$ARCH" "${CURL_CFFI_ARCHES[@]}"; then
+            pkgs+=("${NATIVE_PKGS_CURLCFFI[@]}")
+        fi
+
+        ./build-package.sh -a "$ARCH" -o "$OUTPUT_DIR" python \
+            || die "python build failed for $ARCH"
+        info "extension packages (forced rebuild): ${pkgs[*]}"
+        ./build-package.sh -f -a "$ARCH" -o "$OUTPUT_DIR" "${pkgs[@]}" \
+            || die "build failed for $ARCH"
+
+        # Defensive: collect debs that landed one level up -- but ONLY this arch's
+        # (and arch-independent "_all") so we never pull another arch's debs in here.
+        find "${OUTPUT_BASE_DIR}" -maxdepth 1 -type f \
+            \( -name "*_${ARCH}.deb" -o -name "*_all.deb" \) \
+            -exec mv -t "$OUTPUT_DIR/" {} + 2>/dev/null || true
+        info "built: $ARCH"
+    fi
+
+    ########################  PHASE 3 - merge into JNI zip  ########################
     log "Packaging JNI libs for: $ARCH"
     EX="${WORK}/extract-${ARCH}"
     rm -rf "$EX"; mkdir -p "$EX"
@@ -361,11 +364,14 @@ for ARCH in "${ARCHITECTURES[@]}"; do
     PREFIX_DIR="${EX}/data/data/com.termux/files/usr"
     [ -d "$PREFIX_DIR" ] || die "unexpected extraction layout for $ARCH"
 
-    # Detect the python x.y version dir.
-    pydir=("$PREFIX_DIR"/lib/python3.*)
-    [ -d "${pydir[0]}" ] || die "no python3.x lib dir found for $ARCH"
-    PYVER="$(basename "${pydir[0]}" | sed 's/^python//')"
-    SITE="${pydir[0]}/site-packages"
+    # Detect the python x.y version dir. More than one means an extension .deb was built against
+    # another python (stale .deb in output/<arch>/) and would be invisible to the interpreter.
+    pydir=("$PREFIX_DIR"/lib/python3.*/)
+    [ "${#pydir[@]}" -gt 0 ] || die "no python3.x lib dir found for $ARCH"
+    [ "${#pydir[@]}" -eq 1 ] || die "several python lib dirs for $ARCH ($(for d in "${pydir[@]}"; do basename "$d"; done | tr '\n' ' ')): remove the stale .debs from output/${ARCH}/ and rebuild"
+    pydir="${pydir[0]%/}"
+    PYVER="$(basename "$pydir" | sed 's/^python//')"
+    SITE="${pydir}/site-packages"
     mkdir -p "$SITE"
     info "python $PYVER  ->  site-packages"
 
@@ -374,9 +380,23 @@ for ARCH in "${ARCHITECTURES[@]}"; do
     if $curl_cffi_here; then
         info "injecting curl-cffi (cffi is native, from python-cffi.deb)"
         cp -a "${CURLCFFI_SITE}/." "$SITE/"
-        # Retarget the wheel's libpython3.13.so dependency to our libpython.
-        patch_curl_cffi_libpython "$SITE/curl_cffi/_wrapper.abi3.so" "$PYVER"
+        for so in "$SITE"/curl_cffi/_wrapper*.so; do patch_curl_cffi_libpython "$so" "$PYVER"; done
     fi
+
+    # termux's python-pip replaces pip's vendored CA file with an absolute symlink to termux's
+    # <prefix>/etc/tls/cert.pem, which doesn't exist inside the app (pip then fails every request
+    # with FileNotFoundError). Give pip a real copy of the bundled certifi's CA file instead.
+    pip_ca="${SITE}/pip/_vendor/certifi/cacert.pem"
+    if [ -L "$pip_ca" ]; then
+        [ -f "${SITE}/certifi/cacert.pem" ] || die "certifi/cacert.pem not found (is certifi still in PURE_PKGS?)"
+        rm "$pip_ca"
+        cp "${SITE}/certifi/cacert.pem" "$pip_ca"
+        info "pip CA file -> copy of certifi's cacert.pem"
+    fi
+
+    # Prune build-only files from the zipped usr/lib (headers in usr/include are not zipped anyway).
+    rm -rf "${PREFIX_DIR}/lib/pkgconfig" "${PREFIX_DIR}/lib/cmake" "${pydir}/test"
+    find "${PREFIX_DIR}/lib" -type f -name '*.a' -delete
 
     # Sanity check: the interpreter binary must exist.
     PYBIN="${PREFIX_DIR}/bin/python${PYVER}"
@@ -384,17 +404,36 @@ for ARCH in "${ARCHITECTURES[@]}"; do
 
     # Package-unique library names. libpython keeps its name: native wheels pip installs
     # later on the device link against libpython3.x.so.
-    isolate_libs "$PREFIX_DIR" python '^libpython'
+    if [ "$ISOLATE" = "1" ]; then
+        isolate_libs "$PREFIX_DIR" python '^libpython'
+    else
+        info "isolate: off (ISOLATE=0), python's libs keep their plain names"
+    fi
 
     # Every DT_NEEDED of the interpreter and its extension modules must now be bundled (or be an
     # Android system lib), otherwise a rename was missed and it would only show up on the device.
+    # Wheels vendor their own libs next to the package (curl_cffi.libs/libc++_shared-<hash>.so) and
+    # find them via RUNPATH $ORIGIN/../<pkg>.libs, so those count as bundled too.
     missing=()
-    while IFS= read -r n; do
-        case " libc.so libm.so libdl.so liblog.so libandroid.so libz.so " in *" $n "*) continue ;; esac
-        [ -e "${PREFIX_DIR}/lib/$n" ] || missing+=("$n")
-    done < <(find "${PREFIX_DIR}/bin" "${PREFIX_DIR}/lib" -type f \( -path "${PREFIX_DIR}/bin/*" -o -name '*.so' -o -name '*.so.*' \) \
-                 -exec patchelf --print-needed {} \; 2>/dev/null | sort -u)
-    [ "${#missing[@]}" -eq 0 ] || die "libraries needed by python but not in the bundle for $ARCH: ${missing[*]}"
+    while IFS= read -r f; do
+        while IFS= read -r n; do
+            [ -n "$n" ] || continue
+            case " libc.so libm.so libdl.so liblog.so libandroid.so libz.so " in *" $n "*) continue ;; esac
+            [ -e "${PREFIX_DIR}/lib/$n" ] && continue
+            compgen -G "$(dirname "$f")/../*.libs/$n" >/dev/null && continue
+            missing+=("$n (needed by ${f#"${PREFIX_DIR}/"})")
+        done < <(patchelf --print-needed "$f" 2>/dev/null || true)
+    done < <(find "${PREFIX_DIR}/bin" "${PREFIX_DIR}/lib" -type f \( -path "${PREFIX_DIR}/bin/*" -o -name '*.so' -o -name '*.so.*' \))
+    [ "${#missing[@]}" -eq 0 ] || die "libraries needed by python but not in the bundle for $ARCH: $(printf '%s\n' "${missing[@]}" | sort -u | tr '\n' ' ')"
+
+    # No symlink in the zipped tree may point into termux's own prefix: inside the app that path
+    # doesn't exist, so the link dangles and only fails on the device (like pip's CA file did).
+    bad=()
+    while IFS= read -r f; do
+        tgt="$(readlink "$f")"
+        case "$tgt" in /data/data/com.termux/*) bad+=("${f#"${PREFIX_DIR}/"} -> $tgt") ;; esac
+    done < <(find "${PREFIX_DIR}/lib" "${PREFIX_DIR}/etc" -type l 2>/dev/null)
+    [ "${#bad[@]}" -eq 0 ] || die "symlinks into the termux prefix (they would dangle in the app) for $ARCH: $(printf '%s\n' "${bad[@]}" | tr '\n' ' ')"
 
     # Build the two artifacts.
     tmp_so="${WORK}/libpython.so"

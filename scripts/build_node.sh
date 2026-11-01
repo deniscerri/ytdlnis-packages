@@ -58,7 +58,10 @@ SYSTEM_LIBS=("libc.so" "libm.so" "libdl.so" "liblog.so" "libandroid.so")
 USE_ANDROID_ABI_NAMES=true
 OUTPUT_BASE_DIR="${PWD}/output"
 JNI_DIR="${OUTPUT_BASE_DIR}/jniLibs"
-WORK="${OUTPUT_BASE_DIR}/_work"
+# Scratch dir for unpacking/patching. Must be on the container's own filesystem: on a bind-mounted
+# Windows/macOS checkout (Docker Desktop) tar fails with "Directory renamed before its status could
+# be extracted" and symlinks/patchelf are unreliable. Only the final artifacts go to output/.
+WORK="${WORK_DIR:-/tmp/ytdlnis-work}/node"
 
 #################################################################
 
@@ -104,13 +107,20 @@ tag_soname() { printf '%s_%s.so%s' "${1%%.so*}" "$2" "${1#*.so}"; }
 
 # isolate_libs <usr-dir> <tag> [regex of sonames to leave untouched]
 isolate_libs() {
-    local usr="$1" tag="$2" keep="${3:-}" lib="$1/lib" f soname new n patched=0
-    local -A map=()
+    local usr="$1" tag="$2" keep="${3:-}" lib="$1/lib" f soname new n base patched=0
+    local -A map=() renamed=() links=()
     local args=()
+
+    # 0. remember which real file every usr/lib symlink points at. A lib without a SONAME (libsqlite)
+    #    is linked by the symlink's name (DT_NEEDED libsqlite3.so), so that name has to follow the rename.
+    while IFS= read -r f; do
+        links["$(basename "$f")"]="$(basename "$(readlink -f "$f")")"
+    done < <(find "$lib" -maxdepth 1 -type l -name '*.so*')
 
     # 1. rename every real shared library in usr/lib to its tagged soname
     while IFS= read -r f; do
         is_elf "$f" || continue
+        base="$(basename "$f")"
         soname="$(patchelf --print-soname "$f" 2>/dev/null || true)"
         [ -n "$soname" ] || soname="$(basename "$f")"
         case "$soname" in *.so|*.so.*) ;; *) continue ;; esac
@@ -124,7 +134,15 @@ isolate_libs() {
         patchelf --page-size "$ELF_PAGE_SIZE" --set-soname "$new" "$f"
         mv "$f" "$lib/$new"
         map["$soname"]="$new"
+        renamed["$base"]="$new"
     done < <(find "$lib" -maxdepth 1 -type f -name '*.so*')
+
+    # 1b. symlink names of a renamed lib (libsqlite3.so -> libsqlite3.so.3.54.1) map to it as well
+    for n in "${!links[@]}"; do
+        if [ -z "${map[$n]:-}" ] && [ -n "${links[$n]}" ] && [ -n "${renamed[${links[$n]}]:-}" ]; then
+            map["$n"]="${renamed[${links[$n]}]}"
+        fi
+    done
 
     # 2. the old symlinks (libfoo.so -> libfoo.so.1) now dangle: drop them, point the old sonames at the renamed files
     find "$lib" -maxdepth 1 -xtype l -delete
@@ -145,7 +163,7 @@ isolate_libs() {
         fi
     done < <(find "$usr" -type f \( -path "$usr/bin/*" -o -name '*.so' -o -name '*.so.*' -o -name '*.node' \))
 
-    info "isolate: renamed ${#map[@]} libs to *_${tag}.so*, rewrote DT_NEEDED in $patched files"
+    info "isolate: renamed ${#renamed[@]} libs to *_${tag}.so*, rewrote DT_NEEDED in $patched files"
 }
 
 # Print one .deb per package (its highest version) from an arch output dir. Rebuilding for a newer
@@ -235,35 +253,36 @@ else
 fi
 log "Target arches: ${ARCHITECTURES[*]}   (SKIP_BUILD=${SKIP_BUILD}, NODE_SHELL=${NODE_SHELL})"
 
-########################  PHASE 1 - build per arch  ########################
 if [ "$SKIP_BUILD" = "1" ]; then
-    log "SKIP_BUILD=1 -> skipping Phase 1, reusing existing .debs in output/<arch>/"
+    log "SKIP_BUILD=1 -> skipping the builds, reusing existing .debs in output/<arch>/"
 else
     log "Checking termux recipe is patched (run PREP_ONLY=1 ./build_node.sh on the host first)"
     # No-op when already patched; only edits the file when run outside the container.
     patch_termux_recipe
 fi
+
+# Each arch is built AND packaged before the next one starts, so a finished arch can be
+# tested while the others are still building (and a packaging error shows up early).
 for ARCH in "${ARCHITECTURES[@]}"; do
-    if [ "$SKIP_BUILD" = "1" ]; then continue; fi
+    ########################  PHASE 1 - build  ########################
     OUTPUT_DIR="${OUTPUT_BASE_DIR}/${ARCH}"
     mkdir -p "$OUTPUT_DIR"
 
-    for PKG in "${PKGS[@]}"; do
-        log "Building $PKG for: $ARCH"
-        # -f: rebuild even if termux thinks it is built, otherwise the recipe patch above is skipped.
-        ./build-package.sh -f -a "$ARCH" -o "$OUTPUT_DIR" "$PKG" \
-            || die "build failed for $PKG ($ARCH)"
+    if [ "$SKIP_BUILD" != "1" ]; then
+        for PKG in "${PKGS[@]}"; do
+            log "Building $PKG for: $ARCH"
+            # -f: rebuild even if termux thinks it is built, otherwise the recipe patch above is skipped.
+            ./build-package.sh -f -a "$ARCH" -o "$OUTPUT_DIR" "$PKG" \
+                || die "build failed for $PKG ($ARCH)"
 
-        find "${OUTPUT_BASE_DIR}" -maxdepth 1 -type f \
-            \( -name "*_${ARCH}.deb" -o -name "*_all.deb" \) \
-            -exec mv -t "$OUTPUT_DIR/" {} + 2>/dev/null || true
-    done
+            find "${OUTPUT_BASE_DIR}" -maxdepth 1 -type f \
+                \( -name "*_${ARCH}.deb" -o -name "*_all.deb" \) \
+                -exec mv -t "$OUTPUT_DIR/" {} + 2>/dev/null || true
+        done
+        info "built: $ARCH"
+    fi
 
-    info "done: $ARCH"
-done
-
-########################  PHASE 2 - merge, fix, verify, pack  ########################
-for ARCH in "${ARCHITECTURES[@]}"; do
+    ########################  PHASE 2 - merge, fix, verify, pack  ########################
     log "Packaging JNI libs for: $ARCH"
     EX="${WORK}/extract-${ARCH}"
     rm -rf "$EX"; mkdir -p "$EX"

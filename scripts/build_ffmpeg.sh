@@ -36,7 +36,10 @@ FFMPEG_PKG="ffmpeg"
 USE_ANDROID_ABI_NAMES=true
 OUTPUT_BASE_DIR="${PWD}/output"
 JNI_DIR="${OUTPUT_BASE_DIR}/jniLibs"
-WORK="${OUTPUT_BASE_DIR}/_work"
+# Scratch dir for unpacking/patching. Must be on the container's own filesystem: on a bind-mounted
+# Windows/macOS checkout (Docker Desktop) tar fails with "Directory renamed before its status could
+# be extracted" and symlinks/patchelf are unreliable. Only the final artifacts go to output/.
+WORK="${WORK_DIR:-/tmp/ytdlnis-work}/ffmpeg"
 
 # Live termux install prefix inside the build container (all deps stay installed
 # here so the target can link -- our completeness fallback source).
@@ -94,13 +97,20 @@ tag_soname() { printf '%s_%s.so%s' "${1%%.so*}" "$2" "${1#*.so}"; }
 
 # isolate_libs <usr-dir> <tag> [regex of sonames to leave untouched]
 isolate_libs() {
-    local usr="$1" tag="$2" keep="${3:-}" lib="$1/lib" f soname new n patched=0
-    local -A map=()
+    local usr="$1" tag="$2" keep="${3:-}" lib="$1/lib" f soname new n base patched=0
+    local -A map=() renamed=() links=()
     local args=()
+
+    # 0. remember which real file every usr/lib symlink points at. A lib without a SONAME (libsqlite)
+    #    is linked by the symlink's name (DT_NEEDED libsqlite3.so), so that name has to follow the rename.
+    while IFS= read -r f; do
+        links["$(basename "$f")"]="$(basename "$(readlink -f "$f")")"
+    done < <(find "$lib" -maxdepth 1 -type l -name '*.so*')
 
     # 1. rename every real shared library in usr/lib to its tagged soname
     while IFS= read -r f; do
         is_elf "$f" || continue
+        base="$(basename "$f")"
         soname="$(patchelf --print-soname "$f" 2>/dev/null || true)"
         [ -n "$soname" ] || soname="$(basename "$f")"
         case "$soname" in *.so|*.so.*) ;; *) continue ;; esac
@@ -114,7 +124,15 @@ isolate_libs() {
         patchelf --page-size "$ELF_PAGE_SIZE" --set-soname "$new" "$f"
         mv "$f" "$lib/$new"
         map["$soname"]="$new"
+        renamed["$base"]="$new"
     done < <(find "$lib" -maxdepth 1 -type f -name '*.so*')
+
+    # 1b. symlink names of a renamed lib (libsqlite3.so -> libsqlite3.so.3.54.1) map to it as well
+    for n in "${!links[@]}"; do
+        if [ -z "${map[$n]:-}" ] && [ -n "${links[$n]}" ] && [ -n "${renamed[${links[$n]}]:-}" ]; then
+            map["$n"]="${renamed[${links[$n]}]}"
+        fi
+    done
 
     # 2. the old symlinks (libfoo.so -> libfoo.so.1) now dangle: drop them, point the old sonames at the renamed files
     find "$lib" -maxdepth 1 -xtype l -delete
@@ -135,7 +153,7 @@ isolate_libs() {
         fi
     done < <(find "$usr" -type f \( -path "$usr/bin/*" -o -name '*.so' -o -name '*.so.*' -o -name '*.node' \))
 
-    info "isolate: renamed ${#map[@]} libs to *_${tag}.so*, rewrote DT_NEEDED in $patched files"
+    info "isolate: renamed ${#renamed[@]} libs to *_${tag}.so*, rewrote DT_NEEDED in $patched files"
 }
 
 # Print one .deb per package (its highest version) from an arch output dir. Rebuilding for a newer

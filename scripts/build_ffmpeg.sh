@@ -33,6 +33,13 @@ SKIP_BUILD="${SKIP_BUILD:-0}"
 
 FFMPEG_PKG="ffmpeg"
 
+# 1 = shrink the bundle without losing any ffmpeg feature, every codec/filter/protocol stays
+# (0 = package everything, as before):
+#   - strip debug symbols from every library (the code itself is untouched)
+#   - drop libs ffmpeg/ffprobe can't load (other packages built in the same container: python, perl,
+#     X11, ...) plus docs/headers, and usr/share + usr/etc data ffmpeg never reads
+SHRINK_BUNDLE="${SHRINK_BUNDLE:-1}"
+
 USE_ANDROID_ABI_NAMES=true
 OUTPUT_BASE_DIR="${PWD}/output"
 JNI_DIR="${OUTPUT_BASE_DIR}/jniLibs"
@@ -172,6 +179,129 @@ latest_debs() {
     done
     for pkg in "${!best[@]}"; do printf '%s\n' "${best[$pkg]}"; done | sort
 }
+
+# ------------------------------------------------------------------------------------------------
+# Bundle shrinking, used when SHRINK_BUNDLE=1 (top of each script). KEEP IDENTICAL as well.
+#
+# prune_dev_files    headers, docs, man pages, translations, static archives: never read at runtime.
+# prune_unused_libs  output/<arch> holds the .debs of EVERY package built in this container (python,
+#                    ffmpeg, node, deno and all their deps) and every script unpacks all of them, so a
+#                    bundle carried whatever else had been built before it. This keeps only what the
+#                    bundle's own programs can load: the DT_NEEDED closure of the given roots and of the
+#                    kept usr/lib subdirs. A program can't load a lib outside that closure, except by
+#                    dlopen()ing it by name (list those in the keep-libs regex), so no feature is lost.
+# strip_elfs         drops debug info and symbol tables, the code itself is untouched.
+# ------------------------------------------------------------------------------------------------
+du_k() { du -sk "$1" 2>/dev/null | cut -f1; }
+
+find_llvm_strip() {
+    local s="" c
+    for c in "$(command -v llvm-strip 2>/dev/null || true)" \
+             "${NDK:-/nonexistent}"/toolchains/llvm/prebuilt/*/bin/llvm-strip \
+             "$HOME"/lib/android-ndk*/toolchains/llvm/prebuilt/*/bin/llvm-strip \
+             "$(compgen -c llvm-strip- 2>/dev/null | sort -V | tail -1 || true)"; do
+        [ -n "$c" ] || continue
+        c="$(command -v "$c" 2>/dev/null || true)"   # bare names from compgen -> full path
+        if [ -n "$c" ] && [ -x "$c" ]; then s="$c"; break; fi
+    done
+    printf '%s' "$s"
+}
+
+prune_dev_files() {
+    local usr="$1"
+    rm -rf "$usr/include" "$usr/lib/pkgconfig" "$usr/lib/cmake" \
+           "$usr/share/doc" "$usr/share/man" "$usr/share/info" "$usr/share/locale" "$usr/share/gtk-doc"
+    find "$usr" -type f \( -name '*.a' -o -name '*.la' \) -delete
+}
+
+# keep_only <dir> <regex>: delete every entry of <dir> whose name doesn't match
+keep_only() {
+    local dir="$1" re="$2" e
+    [ -d "$dir" ] || return 0
+    for e in "$dir"/* "$dir"/.[!.]*; do
+        [[ "$(basename "$e")" =~ $re ]] || rm -rf "$e"
+    done
+}
+
+# prune_unused_libs <usr> <keep-subdirs-regex> <keep-libs-regex> <root>...
+#   roots: the bundle's programs (files, or dirs searched for ELFs).
+#   keep-subdirs-regex: usr/lib subdirs to keep (their ELFs become roots too), every other subdir goes.
+#   keep-libs-regex: usr/lib libs to keep although nothing links them (dlopen by name), '' for none.
+prune_unused_libs() {
+    local usr="$1" keep_dirs="$2" keep_libs="$3" lib="$1/lib" f n real d removed=0
+    shift 3
+    local -A keep=() seen=()
+    local roots=("$@") queue=()
+
+    while IFS= read -r d; do
+        if [[ "$(basename "$d")" =~ $keep_dirs ]]; then roots+=("$d"); else rm -rf "$d"; fi
+    done < <(find "$lib" -mindepth 1 -maxdepth 1 -type d)
+
+    while IFS= read -r f; do
+        is_elf "$f" && queue+=("$f")
+    done < <(find "${roots[@]}" -type f 2>/dev/null)
+    if [ -n "$keep_libs" ]; then
+        while IFS= read -r f; do
+            n="$(basename "$f")"
+            if [[ "$n" =~ $keep_libs ]] && is_elf "$f"; then keep["$n"]=1; queue+=("$f"); fi
+        done < <(find "$lib" -maxdepth 1 -type f -name '*.so*')
+    fi
+
+    # walk DT_NEEDED: a needed name is usr/lib/<name>, often a symlink to the real file
+    while [ "${#queue[@]}" -gt 0 ]; do
+        f="${queue[0]}"; queue=("${queue[@]:1}")
+        [ -z "${seen[$f]:-}" ] || continue
+        seen["$f"]=1
+        while IFS= read -r n; do
+            [ -n "$n" ] && [ -e "$lib/$n" ] || continue
+            real="$(readlink -f "$lib/$n")"
+            keep["$n"]=1
+            keep["$(basename "$real")"]=1
+            queue+=("$real")
+        done < <(patchelf --print-needed "$f" 2>/dev/null || true)
+    done
+
+    # drop the libs nothing reaches. Symlinks to a kept lib stay (other names it may be dlopen()ed by),
+    # non-ELF files are left alone.
+    while IFS= read -r f; do
+        n="$(basename "$f")"
+        if [ -L "$f" ]; then
+            [ -z "${keep[$(basename "$(readlink -f "$f")")]:-}" ] || continue
+        else
+            is_elf "$f" || continue
+            [ -z "${keep[$n]:-}" ] || continue
+        fi
+        rm -f "$f"
+        removed=$((removed + 1))
+    done < <(find "$lib" -maxdepth 1 \( -type f -o -type l \) -name '*.so*')
+    find "$lib" -maxdepth 1 -xtype l -delete
+    info "prune: removed $removed unused libs from usr/lib"
+}
+
+strip_elfs() {
+    local usr="$1" s f n=0
+    s="$(find_llvm_strip)"
+    if [ -z "$s" ]; then
+        info "strip: llvm-strip not found, skipped"
+        return 0
+    fi
+    while IFS= read -r f; do
+        is_elf "$f" || continue
+        if "$s" --strip-unneeded "$f" </dev/null 2>/dev/null; then n=$((n + 1)); fi
+    done < <(find "$usr" -type f)
+    info "strip: stripped $n ELF files ($(basename "$s"))"
+}
+
+# shrink_bundle <usr> <keep-subdirs-regex> <keep-libs-regex> <root>...
+#   Run before isolate_libs: it works on the plain lib names, and strip rewrites what patchelf lays out.
+shrink_bundle() {
+    local usr="$1" before
+    before="$(du_k "$usr")"
+    prune_dev_files "$usr"
+    prune_unused_libs "$@"
+    strip_elfs "$usr"
+    info "shrink: usr ${before}K -> $(du_k "$usr")K"
+}
 # ------------------------------------------------------------------------------------------------
 
 check_prereqs() {
@@ -236,7 +366,7 @@ verify_closure() {
             missing+=("$n  (needed by $(basename "$f"))")
         done < <(needed_of "$f")
     done < <({ find "$usr/lib" -maxdepth 1 -name '*.so*' 2>/dev/null; \
-               find "$usr/bin" -maxdepth 1 -type f 2>/dev/null; })
+               ls "$usr/bin/ffmpeg" "$usr/bin/ffprobe" 2>/dev/null; })   # only what ships: other bin/ tools aren't packaged
     if [ "${#missing[@]}" -gt 0 ]; then
         printf '\n\033[1;31m*** INCOMPLETE BUNDLE -- missing shared libraries: ***\033[0m\n' >&2
         printf '%s\n' "${missing[@]}" | sort -u >&2
@@ -313,6 +443,14 @@ for ARCH in "${ARCHITECTURES[@]}"; do
         done
     fi
 
+    if [ "$SHRINK_BUNDLE" = "1" ]; then
+        shrink_bundle "$USR" '^(ossl-modules|engines-3)$' '' "${USR}/bin/ffmpeg" "${USR}/bin/ffprobe"
+        # data ffmpeg does read: fonts + fontconfig (libass subtitles, drawtext), its presets (-pre),
+        # libmysofa's HRTF files (sofalizer) and openssl's config/certs
+        keep_only "${USR}/share" '^(fonts|fontconfig|ffmpeg|libmysofa)$'
+        keep_only "${USR}/etc" '^(fonts|tls)$'
+    fi
+
     # Package-unique library names (before the verify, so it also checks the rewritten names).
     isolate_libs "$USR" ffmpeg
 
@@ -342,7 +480,7 @@ done
 log "All done. JNI libraries are in: ${JNI_DIR}"
 for ARCH in "${ARCHITECTURES[@]}"; do
     if $USE_ANDROID_ABI_NAMES; then n="$(android_abi "$ARCH")"; else n="$ARCH"; fi
-    info "$n : $(ls -1 "${JNI_DIR}/${n}" 2>/dev/null | tr '\n' ' ')"
+    info "$n : $(cd "${JNI_DIR}/${n}" 2>/dev/null && du -h -- * | awk '{printf "%s (%s)  ", $2, $1}')"
 done
 
 if [ "${#incomplete[@]}" -gt 0 ]; then

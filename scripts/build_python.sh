@@ -45,6 +45,14 @@ SKIP_BUILD="${SKIP_BUILD:-0}"
 # bundles on LD_LIBRARY_PATH (their plain names are symlinks to their own renamed libs).
 ISOLATE="${ISOLATE:-0}"
 
+# 1 = shrink the bundle (0 = package everything, as before):
+#   - strip debug symbols from every library (the code itself is untouched)
+#   - drop libs nothing in python links against: the tk/tcl/X11 stack (pulled in by python's tk build
+#     dependency) and libs of other packages built in the same container
+#   - drop stdlib parts that can't run in the app: tkinter (needs an X server), idlelib + turtle
+#     (tkinter GUIs), ensurepip (installs the pip that is already bundled), pydoc_data (offline help() text)
+SHRINK_BUNDLE="${SHRINK_BUNDLE:-1}"
+
 # Arches that additionally get cffi + curl-cffi (curl-cffi only ships an arm64
 # android wheel, and cffi is its native runtime dependency).
 CURL_CFFI_ARCHES=("aarch64")
@@ -213,6 +221,129 @@ latest_debs() {
         fi
     done
     for pkg in "${!best[@]}"; do printf '%s\n' "${best[$pkg]}"; done | sort
+}
+
+# ------------------------------------------------------------------------------------------------
+# Bundle shrinking, used when SHRINK_BUNDLE=1 (top of each script). KEEP IDENTICAL as well.
+#
+# prune_dev_files    headers, docs, man pages, translations, static archives: never read at runtime.
+# prune_unused_libs  output/<arch> holds the .debs of EVERY package built in this container (python,
+#                    ffmpeg, node, deno and all their deps) and every script unpacks all of them, so a
+#                    bundle carried whatever else had been built before it. This keeps only what the
+#                    bundle's own programs can load: the DT_NEEDED closure of the given roots and of the
+#                    kept usr/lib subdirs. A program can't load a lib outside that closure, except by
+#                    dlopen()ing it by name (list those in the keep-libs regex), so no feature is lost.
+# strip_elfs         drops debug info and symbol tables, the code itself is untouched.
+# ------------------------------------------------------------------------------------------------
+du_k() { du -sk "$1" 2>/dev/null | cut -f1; }
+
+find_llvm_strip() {
+    local s="" c
+    for c in "$(command -v llvm-strip 2>/dev/null || true)" \
+             "${NDK:-/nonexistent}"/toolchains/llvm/prebuilt/*/bin/llvm-strip \
+             "$HOME"/lib/android-ndk*/toolchains/llvm/prebuilt/*/bin/llvm-strip \
+             "$(compgen -c llvm-strip- 2>/dev/null | sort -V | tail -1 || true)"; do
+        [ -n "$c" ] || continue
+        c="$(command -v "$c" 2>/dev/null || true)"   # bare names from compgen -> full path
+        if [ -n "$c" ] && [ -x "$c" ]; then s="$c"; break; fi
+    done
+    printf '%s' "$s"
+}
+
+prune_dev_files() {
+    local usr="$1"
+    rm -rf "$usr/include" "$usr/lib/pkgconfig" "$usr/lib/cmake" \
+           "$usr/share/doc" "$usr/share/man" "$usr/share/info" "$usr/share/locale" "$usr/share/gtk-doc"
+    find "$usr" -type f \( -name '*.a' -o -name '*.la' \) -delete
+}
+
+# keep_only <dir> <regex>: delete every entry of <dir> whose name doesn't match
+keep_only() {
+    local dir="$1" re="$2" e
+    [ -d "$dir" ] || return 0
+    for e in "$dir"/* "$dir"/.[!.]*; do
+        [[ "$(basename "$e")" =~ $re ]] || rm -rf "$e"
+    done
+}
+
+# prune_unused_libs <usr> <keep-subdirs-regex> <keep-libs-regex> <root>...
+#   roots: the bundle's programs (files, or dirs searched for ELFs).
+#   keep-subdirs-regex: usr/lib subdirs to keep (their ELFs become roots too), every other subdir goes.
+#   keep-libs-regex: usr/lib libs to keep although nothing links them (dlopen by name), '' for none.
+prune_unused_libs() {
+    local usr="$1" keep_dirs="$2" keep_libs="$3" lib="$1/lib" f n real d removed=0
+    shift 3
+    local -A keep=() seen=()
+    local roots=("$@") queue=()
+
+    while IFS= read -r d; do
+        if [[ "$(basename "$d")" =~ $keep_dirs ]]; then roots+=("$d"); else rm -rf "$d"; fi
+    done < <(find "$lib" -mindepth 1 -maxdepth 1 -type d)
+
+    while IFS= read -r f; do
+        is_elf "$f" && queue+=("$f")
+    done < <(find "${roots[@]}" -type f 2>/dev/null)
+    if [ -n "$keep_libs" ]; then
+        while IFS= read -r f; do
+            n="$(basename "$f")"
+            if [[ "$n" =~ $keep_libs ]] && is_elf "$f"; then keep["$n"]=1; queue+=("$f"); fi
+        done < <(find "$lib" -maxdepth 1 -type f -name '*.so*')
+    fi
+
+    # walk DT_NEEDED: a needed name is usr/lib/<name>, often a symlink to the real file
+    while [ "${#queue[@]}" -gt 0 ]; do
+        f="${queue[0]}"; queue=("${queue[@]:1}")
+        [ -z "${seen[$f]:-}" ] || continue
+        seen["$f"]=1
+        while IFS= read -r n; do
+            [ -n "$n" ] && [ -e "$lib/$n" ] || continue
+            real="$(readlink -f "$lib/$n")"
+            keep["$n"]=1
+            keep["$(basename "$real")"]=1
+            queue+=("$real")
+        done < <(patchelf --print-needed "$f" 2>/dev/null || true)
+    done
+
+    # drop the libs nothing reaches. Symlinks to a kept lib stay (other names it may be dlopen()ed by),
+    # non-ELF files are left alone.
+    while IFS= read -r f; do
+        n="$(basename "$f")"
+        if [ -L "$f" ]; then
+            [ -z "${keep[$(basename "$(readlink -f "$f")")]:-}" ] || continue
+        else
+            is_elf "$f" || continue
+            [ -z "${keep[$n]:-}" ] || continue
+        fi
+        rm -f "$f"
+        removed=$((removed + 1))
+    done < <(find "$lib" -maxdepth 1 \( -type f -o -type l \) -name '*.so*')
+    find "$lib" -maxdepth 1 -xtype l -delete
+    info "prune: removed $removed unused libs from usr/lib"
+}
+
+strip_elfs() {
+    local usr="$1" s f n=0
+    s="$(find_llvm_strip)"
+    if [ -z "$s" ]; then
+        info "strip: llvm-strip not found, skipped"
+        return 0
+    fi
+    while IFS= read -r f; do
+        is_elf "$f" || continue
+        if "$s" --strip-unneeded "$f" </dev/null 2>/dev/null; then n=$((n + 1)); fi
+    done < <(find "$usr" -type f)
+    info "strip: stripped $n ELF files ($(basename "$s"))"
+}
+
+# shrink_bundle <usr> <keep-subdirs-regex> <keep-libs-regex> <root>...
+#   Run before isolate_libs: it works on the plain lib names, and strip rewrites what patchelf lays out.
+shrink_bundle() {
+    local usr="$1" before
+    before="$(du_k "$usr")"
+    prune_dev_files "$usr"
+    prune_unused_libs "$@"
+    strip_elfs "$usr"
+    info "shrink: usr ${before}K -> $(du_k "$usr")K"
 }
 # ------------------------------------------------------------------------------------------------
 
@@ -398,6 +529,14 @@ for ARCH in "${ARCHITECTURES[@]}"; do
     rm -rf "${PREFIX_DIR}/lib/pkgconfig" "${PREFIX_DIR}/lib/cmake" "${pydir}/test"
     find "${PREFIX_DIR}/lib" -type f -name '*.a' -delete
 
+    if [ "$SHRINK_BUNDLE" = "1" ]; then
+        rm -rf "${pydir}"/{idlelib,tkinter,turtledemo,ensurepip,pydoc_data} "${pydir}/turtle.py" \
+               "${pydir}"/lib-dynload/_tkinter*.so "${PREFIX_DIR}"/lib/{tcl,tk,tcloo}Config.sh "${PREFIX_DIR}/etc/fonts"
+        # libpython3.so is the stable-ABI shim: nothing bundled links it, abi3 wheels pip installs later can
+        shrink_bundle "$PREFIX_DIR" '^(python3\.[0-9]+|ossl-modules|engines-3)$' '^libpython' \
+            "${PREFIX_DIR}/bin/python${PYVER}"
+    fi
+
     # Sanity check: the interpreter binary must exist.
     PYBIN="${PREFIX_DIR}/bin/python${PYVER}"
     [ -f "$PYBIN" ] || die "python${PYVER} binary not found for $ARCH"
@@ -423,7 +562,7 @@ for ARCH in "${ARCHITECTURES[@]}"; do
             compgen -G "$(dirname "$f")/../*.libs/$n" >/dev/null && continue
             missing+=("$n (needed by ${f#"${PREFIX_DIR}/"})")
         done < <(patchelf --print-needed "$f" 2>/dev/null || true)
-    done < <(find "${PREFIX_DIR}/bin" "${PREFIX_DIR}/lib" -type f \( -path "${PREFIX_DIR}/bin/*" -o -name '*.so' -o -name '*.so.*' \))
+    done < <(echo "$PYBIN"; find "${PREFIX_DIR}/lib" -type f \( -name '*.so' -o -name '*.so.*' \))   # only what ships: other bin/ tools aren't packaged
     [ "${#missing[@]}" -eq 0 ] || die "libraries needed by python but not in the bundle for $ARCH: $(printf '%s\n' "${missing[@]}" | sort -u | tr '\n' ' ')"
 
     # No symlink in the zipped tree may point into termux's own prefix: inside the app that path
@@ -453,5 +592,5 @@ done
 log "All done. JNI libraries are in: ${JNI_DIR}"
 for ARCH in "${ARCHITECTURES[@]}"; do
     if $USE_ANDROID_ABI_NAMES; then n="$(android_abi "$ARCH")"; else n="$ARCH"; fi
-    info "$n : $(ls -1 "${JNI_DIR}/${n}" 2>/dev/null | tr '\n' ' ')"
+    info "$n : $(cd "${JNI_DIR}/${n}" 2>/dev/null && du -h -- * | awk '{printf "%s (%s)  ", $2, $1}')"
 done

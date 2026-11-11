@@ -31,9 +31,14 @@ shopt -s nullglob
 ALL_ARCHES=("aarch64" "arm" "i686" "x86_64")
 SKIP_BUILD="${SKIP_BUILD:-0}"
 
-FFMPEG_PKG="ffmpeg"
+# packages/ffmpeg-ytdlnis: ffmpeg trimmed to what yt-dlp/YTDLnis use (see its build.sh for the list).
+# FFMPEG_PKG=ffmpeg builds termux's full ffmpeg instead.
+FFMPEG_PKG="${FFMPEG_PKG:-ffmpeg-ytdlnis}"
+# 1 = include libvorbis (yt-dlp --audio-format vorbis / ogg). Slim build only.
+FFMPEG_VORBIS="${FFMPEG_VORBIS:-1}"
+export YTDLNIS_FFMPEG_VORBIS="$FFMPEG_VORBIS"
 
-# 1 = shrink the bundle without losing any ffmpeg feature, every codec/filter/protocol stays
+# 1 = shrink the bundle without losing any feature of the ffmpeg that was built
 # (0 = package everything, as before):
 #   - strip debug symbols from every library (the code itself is untouched)
 #   - drop libs ffmpeg/ffprobe can't load (other packages built in the same container: python, perl,
@@ -230,11 +235,11 @@ keep_only() {
 prune_unused_libs() {
     local usr="$1" keep_dirs="$2" keep_libs="$3" lib="$1/lib" f n real d removed=0
     shift 3
-    local -A keep=() seen=()
-    local roots=("$@") queue=()
+    local -A keep=() seen=() reached=()
+    local roots=("$@") queue=() drop_dirs=()
 
     while IFS= read -r d; do
-        if [[ "$(basename "$d")" =~ $keep_dirs ]]; then roots+=("$d"); else rm -rf "$d"; fi
+        if [[ "$(basename "$d")" =~ $keep_dirs ]]; then roots+=("$d"); else drop_dirs+=("$d"); fi
     done < <(find "$lib" -mindepth 1 -maxdepth 1 -type d)
 
     while IFS= read -r f; do
@@ -257,8 +262,19 @@ prune_unused_libs() {
             real="$(readlink -f "$lib/$n")"
             keep["$n"]=1
             keep["$(basename "$real")"]=1
+            reached["$real"]=1
             queue+=("$real")
         done < <(patchelf --print-needed "$f" 2>/dev/null || true)
+    done
+
+    # Only after the walk: usr/lib/libfoo.so can be a link into a subdir (pulseaudio/libpulsecommon-*.so),
+    # so from a dropped subdir the libs the walk reached stay and everything else goes.
+    for d in ${drop_dirs[@]+"${drop_dirs[@]}"}; do
+        while IFS= read -r f; do
+            real="$(readlink -f "$f" || true)"
+            if [ -z "$real" ] || [ -z "${reached[$real]:-}" ]; then rm -f "$f"; fi
+        done < <(find "$d" -type f -o -type l)
+        find "$d" -type d -empty -delete
     done
 
     # drop the libs nothing reaches. Symlinks to a kept lib stay (other names it may be dlopen()ed by),
@@ -266,7 +282,9 @@ prune_unused_libs() {
     while IFS= read -r f; do
         n="$(basename "$f")"
         if [ -L "$f" ]; then
-            [ -z "${keep[$(basename "$(readlink -f "$f")")]:-}" ] || continue
+            # readlink -f prints nothing when the link's directory is gone
+            real="$(readlink -f "$f" || true)"
+            if [ -n "$real" ] && [ -n "${keep[$(basename "$real")]:-}" ]; then continue; fi
         else
             is_elf "$f" || continue
             [ -z "${keep[$n]:-}" ] || continue
@@ -407,7 +425,8 @@ for ARCH in "${ARCHITECTURES[@]}"; do
 
     if [ "$SKIP_BUILD" != "1" ]; then
         log "Building $FFMPEG_PKG for: $ARCH"
-        ./build-package.sh -a "$ARCH" -o "$OUTPUT_DIR" "$FFMPEG_PKG" || die "build failed for $ARCH"
+        # -f: rebuild ffmpeg itself every run so a changed FFMPEG_VORBIS takes effect (deps are reused)
+        ./build-package.sh -f -a "$ARCH" -o "$OUTPUT_DIR" "$FFMPEG_PKG" || die "build failed for $ARCH"
         find "${OUTPUT_BASE_DIR}" -maxdepth 1 -type f \
             \( -name "*_${ARCH}.deb" -o -name "*_all.deb" \) \
             -exec mv -t "$OUTPUT_DIR/" {} + 2>/dev/null || true
@@ -421,6 +440,8 @@ for ARCH in "${ARCHITECTURES[@]}"; do
     while IFS= read -r deb; do
         base="$(basename "$deb")"
         case "$base" in *-static_*.deb) continue ;; esac
+        # only the selected ffmpeg variant: the other one may be left over in output/ from an earlier run
+        case "$base" in ffmpeg_*|ffmpeg-ytdlnis_*) [[ "$base" == "${FFMPEG_PKG}_"* ]] || continue ;; esac
         info "unpack $base"
         dpkg-deb -x "$deb" "$EX"
     done < <(latest_debs "${OUTPUT_BASE_DIR}/${ARCH}" "$ARCH")

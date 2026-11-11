@@ -198,11 +198,11 @@ keep_only() {
 prune_unused_libs() {
     local usr="$1" keep_dirs="$2" keep_libs="$3" lib="$1/lib" f n real d removed=0
     shift 3
-    local -A keep=() seen=()
-    local roots=("$@") queue=()
+    local -A keep=() seen=() reached=()
+    local roots=("$@") queue=() drop_dirs=()
 
     while IFS= read -r d; do
-        if [[ "$(basename "$d")" =~ $keep_dirs ]]; then roots+=("$d"); else rm -rf "$d"; fi
+        if [[ "$(basename "$d")" =~ $keep_dirs ]]; then roots+=("$d"); else drop_dirs+=("$d"); fi
     done < <(find "$lib" -mindepth 1 -maxdepth 1 -type d)
 
     while IFS= read -r f; do
@@ -225,8 +225,19 @@ prune_unused_libs() {
             real="$(readlink -f "$lib/$n")"
             keep["$n"]=1
             keep["$(basename "$real")"]=1
+            reached["$real"]=1
             queue+=("$real")
         done < <(patchelf --print-needed "$f" 2>/dev/null || true)
+    done
+
+    # Only after the walk: usr/lib/libfoo.so can be a link into a subdir (pulseaudio/libpulsecommon-*.so),
+    # so from a dropped subdir the libs the walk reached stay and everything else goes.
+    for d in ${drop_dirs[@]+"${drop_dirs[@]}"}; do
+        while IFS= read -r f; do
+            real="$(readlink -f "$f" || true)"
+            if [ -z "$real" ] || [ -z "${reached[$real]:-}" ]; then rm -f "$f"; fi
+        done < <(find "$d" -type f -o -type l)
+        find "$d" -type d -empty -delete
     done
 
     # drop the libs nothing reaches. Symlinks to a kept lib stay (other names it may be dlopen()ed by),
@@ -234,7 +245,9 @@ prune_unused_libs() {
     while IFS= read -r f; do
         n="$(basename "$f")"
         if [ -L "$f" ]; then
-            [ -z "${keep[$(basename "$(readlink -f "$f")")]:-}" ] || continue
+            # readlink -f prints nothing when the link's directory is gone
+            real="$(readlink -f "$f" || true)"
+            if [ -n "$real" ] && [ -n "${keep[$(basename "$real")]:-}" ]; then continue; fi
         else
             is_elf "$f" || continue
             [ -z "${keep[$n]:-}" ] || continue

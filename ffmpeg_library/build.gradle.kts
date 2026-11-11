@@ -12,7 +12,7 @@ plugins {
 object LibraryConfig {
     const val GROUP_ID = "io.github.deniscerri"
     const val ARTIFACT_ID = "ytdlnis_packages.ffmpeg"
-    const val VERSION = "2.7.7"
+    const val VERSION = "9.0.2"
     const val NAME = "FFmpeg JNI Library"
     const val DESCRIPTION = "Native shared FFmpeg libraries built from termux-packages packaged for Android"
     const val NAMESPACE = "com.deniscerri.ytdl.ffmpeg.library"

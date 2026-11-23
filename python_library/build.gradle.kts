@@ -12,7 +12,7 @@ plugins {
 object LibraryConfig {
     const val GROUP_ID = "io.github.deniscerri"
     const val ARTIFACT_ID = "ytdlnis_packages.python"
-    const val VERSION = "3.14.6"
+    const val VERSION = "3.14.8"
     const val NAME = "Python JNI Library"
     const val DESCRIPTION = "Native shared python libraries built from termux-packages packaged for Android"
     const val NAMESPACE = "com.deniscerri.ytdl.python.library"
